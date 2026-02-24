@@ -36,3 +36,33 @@ def get_updates():
         .execute()
     )
     return res.data or []
+
+from pydantic import BaseModel
+from typing import Optional, List
+
+class UpdateIn(BaseModel):
+    title: str
+    summary: str
+    jurisdiction: str = "UK"
+    source_url: Optional[str] = None
+    published_at: Optional[str] = None  # keep as text for now
+
+@app.get("/updates")
+def list_updates(limit: int = 20):
+    res = (
+        sb.table("regulatory_updates")
+        .select("id,created_at,title,summary,jurisdiction,source_url,published_at")
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return {"count": len(res.data or []), "items": res.data or []}
+
+@app.post("/updates")
+def create_update(payload: UpdateIn):
+    res = (
+        sb.table("regulatory_updates")
+        .insert(payload.model_dump())
+        .execute()
+    )
+    return {"inserted": res.data}
