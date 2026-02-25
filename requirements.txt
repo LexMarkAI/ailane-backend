@@ -6,3 +6,5 @@ pydantic-settings
 python-dotenv
 httpx
 python-dateutil
+beautifulsoup4
+pytest

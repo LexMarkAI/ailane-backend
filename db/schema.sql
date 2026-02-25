@@ -1,0 +1,3 @@
+-- This schema has been moved to sql/ directory.
+-- See: sql/001_base_tables.sql   (table definitions + RLS)
+--      sql/002_seed_version.sql  (seed data)
