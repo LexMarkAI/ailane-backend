@@ -1,10 +1,13 @@
-// pipeline-govuk-news v15
+// pipeline-govuk-news v16
 // GOV.UK News ingestion for Ailane regulatory intelligence.
 // Writes to public.govuk_news_intelligence (dedicated table).
 // Applies GNYO-001 Levers A (HMRC-narrow), B (expanded orgs), C (no doc_type), D (count=200 + incremental).
 // Constitutional authority: ACEI Art. XI.
 //
-// Managed via Supabase Dashboard. Source of truth: ailane-backend repo.
+// v16 CHANGE: GOV.UK Search API no longer accepts `document_type` in fields=.
+// Uses `format` field instead (JSON key renamed upstream). classifySourceType() reads item.format.
+//
+// Managed via Supabase Dashboard / MCP. Source of truth: ailane-backend repo.
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 
@@ -39,7 +42,6 @@ const BROAD_ORGS: string[] = [
   'equality-and-human-rights-commission',
   'information-commissioners-office',
   'the-pensions-regulator',
-  // 'fair-work-agency', // INCLUDE ONLY IF §0 probe returns HTTP 200 + total>=1
 ];
 
 // HMRC narrow query (Lever A).
@@ -48,7 +50,8 @@ const HMRC_NARROW = {
   q: 'employment OR payroll OR wage OR PAYE OR "national minimum wage" OR "national insurance contributions" OR redundancy OR apprentice OR "off-payroll" OR IR35',
 };
 
-const DEFAULT_FIELDS = ['title', 'description', 'link', 'public_timestamp', 'document_type'].join(',');
+// v16: `format` replaces `document_type` (API schema change).
+const DEFAULT_FIELDS = ['title', 'description', 'link', 'public_timestamp', 'format'].join(',');
 
 // --- Helpers ---
 function hash(s: string): string {
@@ -76,8 +79,8 @@ function inferCategories(text: string): string[] {
   return [...new Set(cats)];
 }
 
-function classifySourceType(docType: string | null | undefined): string {
-  const t = (docType || '').toLowerCase();
+function classifySourceType(formatValue: string | null | undefined): string {
+  const t = (formatValue || '').toLowerCase();
   if (t === 'press_release') return 'govuk_press_release';
   if (t === 'news_story' || t === 'news_article') return 'govuk_news_story';
   if (t === 'guidance' || t === 'detailed_guide') return 'govuk_guidance';
@@ -241,8 +244,9 @@ async function ingestQuery(
       const pubDate = pubTs ? pubTs.split('T')[0] : new Date().toISOString().split('T')[0];
       const link = item.link ? String(item.link) : null;
       const url_canonical = link ? `https://www.gov.uk${link}` : null;
-      const rawDocType = item.document_type ? String(item.document_type) : null;
-      const sourceType = classifySourceType(rawDocType);
+      // v16: read item.format (not item.document_type — renamed by GOV.UK API)
+      const rawFormat = item.format ? String(item.format) : null;
+      const sourceType = classifySourceType(rawFormat);
       const allText = `${title} ${desc}`;
       const acei = inferCategories(allText);
       const contentHash = hash(title + (link ?? ''));
@@ -264,7 +268,7 @@ async function ingestQuery(
         ticker_tier: 'all',
         content_hash: contentHash,
         isrf_file_path: isrfPath,
-        raw_document_type: rawDocType,
+        raw_document_type: rawFormat,
       });
 
       if (error?.code === '23505') duplicate++;
@@ -290,7 +294,7 @@ Deno.serve(async (_req) => {
   }
 
   const runId = await startRun(db);
-  console.log(`[pipeline-govuk-news v15] Run ${runId}`);
+  console.log(`[pipeline-govuk-news v16] Run ${runId}`);
 
   let totalFound = 0, totalInserted = 0, totalDuplicate = 0;
   let maxPubTsOverall: string | null = null;
