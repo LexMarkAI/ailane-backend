@@ -1,3 +1,7 @@
+-- Migration: 20260417202409_gnyo_001_create_govuk_news_intelligence
+-- Applied: backfilled from supabase_migrations.schema_migrations 2026-04-17
+-- Name: gnyo_001_create_govuk_news_intelligence
+
 -- AILANE GNYO-001 — Migration B
 -- Dedicated table for GOV.UK news & agency communications.
 -- Split out of parliamentary_intelligence per Director intent 2026-04-17.
