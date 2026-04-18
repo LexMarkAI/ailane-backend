@@ -1,3 +1,7 @@
+-- Migration: 20260417204416_gnyo_001_retarget_news_pipeline
+-- Applied: backfilled from supabase_migrations.schema_migrations 2026-04-17
+-- Name: gnyo_001_retarget_news_pipeline
+
 -- AILANE GNYO-001 — Migration C
 -- Retarget the existing news pipeline row to the new dedicated table.
 
