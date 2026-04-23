@@ -1,19 +1,3 @@
-// compliance-check v42 — engine v26
-//
-// Phase 2 of CCA-002 per AMD-076 (ratified 22 April 2026).
-// DPIA addendum AMD-078 v1.3 ratified 22 April 2026.
-//
-// ZDR POSTURE (interim, per AILANE-LC-OP-CCA-002-001 Director's Review Note 21 April 2026):
-//   Anthropic Zero Data Retention (ZDR) is deferred on funding grounds. This Edge Function operates
-//   under Anthropic's standard data retention terms. Re-triggers for ZDR activation: first paying
-//   Governance/Institutional client / Phase 1 go-live / GBP 100k cumulative revenue / ICO inquiry.
-//   See DPIA §5.2 G6 and AILANE-LC-OP-CCA-002-001 for full interim-risk acceptance.
-//
-// BINDING DESIGN BOUNDARY (DPIA §4.2):
-//   This Edge Function MUST NOT invoke voyage-law-2 at runtime. Runtime retrieval uses pre-computed
-//   embeddings stored in regulatory_requirements.embedding + pgvector cosine similarity only.
-//   Voyage invocation is confined to the backfill script (ailane-backend/scripts/phase2/).
-
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
@@ -21,7 +5,7 @@ const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const ANTHROPIC_API_KEY = (Deno.env.get("ANTHROPIC_API_KEY") || "").trim();
 
-const ENGINE_VERSION = "v26";
+const ENGINE_VERSION = "v25";
 
 const DOC_TYPE_MAP: Record<string, string> = {
   employment_contract: "contract",
@@ -51,15 +35,12 @@ const MODEL_CHAIN = [
   "claude-haiku-4-5-20251001",
 ];
 
-// v26: 3-model fallback chain per CCA-002 §4.5.5 and DPIA §5.2 G5
-// Per-model timeouts: 45s / 35s / 25s = 105s worst case per batch
-// Parallel batches (A, B, F) run concurrently; total wall clock <= 120s (< 150s cap)
+// v25: Batch model chain — 2 models only to stay within 150s wall clock
+// With 55s timeout × 2 models = 110s max per parallel call, well under 150s
 const BATCH_MODELS = [
   "claude-sonnet-4-6",
-  "claude-sonnet-4-5",
   "claude-haiku-4-5-20251001",
 ];
-const BATCH_TIMEOUTS_MS = [45_000, 35_000, 25_000];
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -90,20 +71,17 @@ async function callClaude(
   user: string,
   maxTokens = 6000,
   abortMs = 55_000,
-  models?: string[],
-  timeoutsMs?: number[],
-): Promise<{ text: string; model: string; ms: number; inputTokens: number; outputTokens: number }> {
+  models?: string[]
+): Promise<{ text: string; model: string; ms: number }> {
   if (!ANTHROPIC_API_KEY) throw new Error("ANTHROPIC_API_KEY not configured");
   const t0 = Date.now();
   const errors: string[] = [];
   const modelList = models || MODEL_CHAIN;
-  for (let i = 0; i < modelList.length; i++) {
-    const model = modelList[i];
-    const timeout = timeoutsMs?.[i] ?? abortMs;
+  for (const model of modelList) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeout);
+    const timer = setTimeout(() => controller.abort(), abortMs);
     try {
-      console.log(`[${ENGINE_VERSION}] Trying ${model} (timeout=${timeout}ms)...`);
+      console.log(`[${ENGINE_VERSION}] Trying ${model}...`);
       const r = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
         headers: {
@@ -121,119 +99,17 @@ async function callClaude(
       const d = await r.json();
       const text = d.content?.find((b: any) => b.type === "text")?.text;
       if (!text) throw new Error(`Empty response from ${model}`);
-      const inputTokens = d.usage?.input_tokens ?? 0;
-      const outputTokens = d.usage?.output_tokens ?? 0;
-      console.log(`[${ENGINE_VERSION}] ✓ ${model} in ${Date.now() - t0}ms (in=${inputTokens} out=${outputTokens})`);
-      return { text, model, ms: Date.now() - t0, inputTokens, outputTokens };
+      console.log(`[${ENGINE_VERSION}] ✓ ${model} in ${Date.now() - t0}ms`);
+      return { text, model, ms: Date.now() - t0 };
     } catch (e) {
       clearTimeout(timer);
       if ((e as Error).message?.includes("401")) throw e;
-      if ((e as Error).name === "AbortError") { errors.push(`${model}: aborted after ${timeout}ms`); continue; }
+      if ((e as Error).name === "AbortError") { errors.push(`${model}: aborted after ${abortMs}ms`); continue; }
       errors.push(`${model}: ${(e as Error).message}`);
       continue;
     }
   }
   throw new Error(`All models failed: ${errors.join(" | ")}`);
-}
-
-interface GroundingRef {
-  source: "provision" | "case";
-  id: string;
-  citation: string;
-  snippet: string;
-  distance: number;
-}
-
-async function retrieveGrounding(
-  supabase: any,
-  requirementId: string,
-  topKProvisions = 3,
-  topKCases = 2,
-): Promise<GroundingRef[]> {
-  // Uses ONLY pre-computed embeddings + pgvector cosine similarity.
-  // NO Voyage API invocation at runtime (§4.2 DPIA boundary).
-
-  const { data: reqRow, error: reqErr } = await supabase
-    .from("regulatory_requirements")
-    .select("id, embedding")
-    .eq("id", requirementId)
-    .single();
-
-  if (reqErr || !reqRow?.embedding) {
-    console.warn(`[${ENGINE_VERSION}] No embedding for requirement ${requirementId}`);
-    return [];
-  }
-
-  const { data: provisions, error: provErr } = await supabase.rpc("kl_grounding_search_provisions", {
-    query_embedding: reqRow.embedding,
-    match_count: topKProvisions,
-  });
-
-  const { data: cases, error: casesErr } = await supabase.rpc("kl_grounding_search_cases", {
-    query_embedding: reqRow.embedding,
-    match_count: topKCases,
-  });
-
-  const refs: GroundingRef[] = [];
-
-  if (!provErr && Array.isArray(provisions)) {
-    for (const p of provisions) {
-      refs.push({
-        source: "provision",
-        id: p.provision_id,
-        citation: `${p.instrument_id || ""} ${p.section_num || ""}`.trim(),
-        snippet: (p.summary || p.current_text || "").slice(0, 300),
-        distance: Number(p.distance) || 0,
-      });
-    }
-  }
-
-  if (!casesErr && Array.isArray(cases)) {
-    for (const c of cases) {
-      refs.push({
-        source: "case",
-        id: c.case_id,
-        citation: c.citation || "",
-        snippet: (c.facts || "").slice(0, 300),
-        distance: Number(c.distance) || 0,
-      });
-    }
-  }
-
-  return refs;
-}
-
-interface ModelPricing { input_usd_per_mtok: number; output_usd_per_mtok: number; }
-
-async function fetchModelPricing(supabase: any): Promise<Map<string, ModelPricing>> {
-  const { data, error } = await supabase
-    .from("eileen_model_pricing")
-    .select("model_name, input_usd_per_mtok, output_usd_per_mtok")
-    .is("effective_to", null);
-
-  const map = new Map<string, ModelPricing>();
-  if (!error && Array.isArray(data)) {
-    for (const row of data) {
-      map.set(row.model_name, {
-        input_usd_per_mtok: Number(row.input_usd_per_mtok),
-        output_usd_per_mtok: Number(row.output_usd_per_mtok),
-      });
-    }
-  }
-  return map;
-}
-
-function computeCallCostUsd(
-  model: string,
-  inputTokens: number,
-  outputTokens: number,
-  pricing: Map<string, ModelPricing>,
-): number {
-  const p = pricing.get(model);
-  if (!p) return 0;
-  const inCost = (inputTokens / 1_000_000) * p.input_usd_per_mtok;
-  const outCost = (outputTokens / 1_000_000) * p.output_usd_per_mtok;
-  return Math.round((inCost + outCost) * 1_000_000) / 1_000_000; // 6dp
 }
 
 async function preScreenDocument(docText: string, declaredType: string): Promise<{ inScope: boolean; detectedType: string; reason: string }> {
@@ -351,8 +227,6 @@ interface Finding {
   is_forward_looking: boolean;
   forward_effective_date: string | null;
   forward_source_act: string | null;
-  grounding_refs: GroundingRef[] | null;
-  model_cost_usd: number | null;
 }
 
 function computeScore(findings: Finding[]): { overallScore: number; translatedPillarScore: number } {
@@ -589,72 +463,31 @@ Deno.serve(async (req: Request) => {
     const batchA = currentReqs.slice(0, mid);
     const batchB = currentReqs.slice(mid);
 
-    const buildBatchPrompt = async (batch: typeof currentReqs, label: string): Promise<{ prompt: string; groundingByReq: Map<string, GroundingRef[]> }> => {
-      const groundingByReq = new Map<string, GroundingRef[]>();
-      const groundingPromises = batch.map(async (r) => {
-        const refs = await retrieveGrounding(supabase, r.id, 3, 2);
-        groundingByReq.set(r.id, refs);
-      });
-      await Promise.all(groundingPromises);
-
-      const reqList = batch.map((r, i) => {
-        const refs = groundingByReq.get(r.id) || [];
-        const groundingBlock = refs.length > 0
-          ? "\n   KL GROUNDING (top ranked by semantic similarity):\n" +
-            refs.map((g, j) => `     [${j + 1}] (${g.source}) ${g.citation}: ${g.snippet}`).join("\n")
-          : "";
-        return `${i + 1}. requirement_id="${r.id}" | REQUIREMENT: ${r.requirement_name} | STATUTORY BASIS: ${r.statutory_basis} | ${r.mandatory ? "MANDATORY — absence is critical" : "Recommended"} | DESCRIPTION: ${r.description}${groundingBlock}`;
-      }).join("\n\n");
-
-      const prompt = `Analyse this ${normalisedDocType} against ${batch.length} UK employment law requirements (Batch ${label} of 2).\n\nFor EACH requirement you are given KL GROUNDING — the most relevant statutory provisions and cases from the Ailane Knowledge Library, ranked by semantic similarity. Use these as reference when assessing the clause. You may cite them in your finding_detail (by square-bracket index) where they support your analysis.\n\nReturn EXACTLY ${batch.length} JSON objects in the SAME ORDER as the numbered list below. Use the exact requirement_id string provided for each item.\n\nFULL DOCUMENT TEXT:\n${fullText}\n\n---\n\nREQUIREMENTS WITH GROUNDING (return one object per item, in order):\n${reqList}`;
-
-      return { prompt, groundingByReq };
+    const buildBatchPrompt = (batch: typeof currentReqs, label: string): string => {
+      const reqList = batch.map((r, i) => `${i + 1}. requirement_id="${r.id}" | REQUIREMENT: ${r.requirement_name} | STATUTORY BASIS: ${r.statutory_basis} | ${r.mandatory ? "MANDATORY — absence is critical" : "Recommended"} | DESCRIPTION: ${r.description}`).join("\n\n");
+      return `Analyse this ${normalisedDocType} against ${batch.length} UK employment law requirements (Batch ${label} of 2).\n\nReturn EXACTLY ${batch.length} JSON objects in the SAME ORDER as the numbered list below. Use the exact requirement_id string provided for each item.\n\nFULL DOCUMENT TEXT:\n${fullText}\n\n---\n\nREQUIREMENTS (return one object per item, in order):\n${reqList}`;
     };
 
     const fwdReqMap = new Map(fwdReqs.map((r) => [r.id, r]));
     const fwdReqNameMap = new Map(fwdReqs.map((r) => [r.requirement_name.toLowerCase().replace(/[^a-z0-9 ]/g, "").trim(), r]));
 
-    const buildForwardPrompt = async (): Promise<{ prompt: string; groundingByReq: Map<string, GroundingRef[]> }> => {
-      const groundingByReq = new Map<string, GroundingRef[]>();
-      const groundingPromises = fwdReqs.map(async (r) => {
-        const refs = await retrieveGrounding(supabase, r.id, 3, 2);
-        groundingByReq.set(r.id, refs);
-      });
-      await Promise.all(groundingPromises);
-
-      const reqList = fwdReqs.map((r, i) => {
-        const refs = groundingByReq.get(r.id) || [];
-        const groundingBlock = refs.length > 0
-          ? "\n   KL GROUNDING (top ranked by semantic similarity):\n" +
-            refs.map((g, j) => `     [${j + 1}] (${g.source}) ${g.citation}: ${g.snippet}`).join("\n")
-          : "";
-        return `${i + 1}. requirement_id="${r.id}" | FUTURE REQUIREMENT: ${r.requirement_name} | STATUTORY BASIS: ${r.statutory_basis} | EXPECTED COMMENCEMENT: ${r.effective_from || 'TBC'} | STATUS: ${r.commencement_status} | ${r.mandatory ? "Will be MANDATORY" : "Recommended"} | DESCRIPTION: ${r.description}${groundingBlock}`;
-      }).join("\n\n");
-
-      const prompt = `Analyse this ${normalisedDocType} for FORWARD EXPOSURE against ${fwdReqs.length} forthcoming UK employment law requirements (Employment Rights Act 2025 provisions not yet in force).\n\nFor EACH requirement you are given KL GROUNDING — the most relevant statutory provisions and cases from the Ailane Knowledge Library, ranked by semantic similarity. Use these as reference when assessing the clause. You may cite them in your finding_detail (by square-bracket index) where they support your analysis.\n\nReturn EXACTLY ${fwdReqs.length} JSON objects in the SAME ORDER as the numbered list below. Use the exact requirement_id string provided for each item.\n\nFULL DOCUMENT TEXT:\n${fullText}\n\n---\n\nFORTHCOMING REQUIREMENTS WITH GROUNDING (return one object per item, in order):\n${reqList}`;
-
-      return { prompt, groundingByReq };
+    const buildForwardPrompt = (): string => {
+      const reqList = fwdReqs.map((r, i) => `${i + 1}. requirement_id="${r.id}" | FUTURE REQUIREMENT: ${r.requirement_name} | STATUTORY BASIS: ${r.statutory_basis} | EXPECTED COMMENCEMENT: ${r.effective_from || 'TBC'} | STATUS: ${r.commencement_status} | ${r.mandatory ? "Will be MANDATORY" : "Recommended"} | DESCRIPTION: ${r.description}`).join("\n\n");
+      return `Analyse this ${normalisedDocType} for FORWARD EXPOSURE against ${fwdReqs.length} forthcoming UK employment law requirements (Employment Rights Act 2025 provisions not yet in force).\n\nReturn EXACTLY ${fwdReqs.length} JSON objects in the SAME ORDER as the numbered list below. Use the exact requirement_id string provided for each item.\n\nFULL DOCUMENT TEXT:\n${fullText}\n\n---\n\nFORTHCOMING REQUIREMENTS (return one object per item, in order):\n${reqList}`;
     };
 
     const tBatch = Date.now();
     console.log(`[${ENGINE_VERSION}] Firing parallel: A(${batchA.length}) B(${batchB.length}) F(${fwdReqs.length}) — ${fullText.length} chars...`);
 
-    // v26: 3-model fallback with per-model timeouts [45_000, 35_000, 25_000] = 105s worst case per batch.
-    // Parallel A/B/F run concurrently; total wall clock <= 120s (< 150s cap).
-    // Grounding is retrieved via pgvector RPCs inside buildBatchPrompt / buildForwardPrompt
-    // (pre-computed embeddings only; no Voyage at runtime per DPIA §4.2).
-    const buildA = await buildBatchPrompt(batchA, "A");
-    const buildB = await buildBatchPrompt(batchB, "B");
-    const buildF = fwdReqs.length > 0 ? await buildForwardPrompt() : null;
-    const groundingByReqA = buildA.groundingByReq;
-    const groundingByReqB = buildB.groundingByReq;
-    const groundingByReqF = buildF?.groundingByReq ?? new Map<string, GroundingRef[]>();
-
+    // v25: Batch timeout 90s→55s, BATCH_MODELS (2 models) instead of MODEL_CHAIN (4)
+    // Worst case: 55s × 2 models = 110s parallel + 15s pre-screen = 125s < 150s wall clock
     const promises: Promise<any>[] = [
-      callClaude(ANALYSIS_SYSTEM_PROMPT, buildA.prompt, 6000, 55_000, BATCH_MODELS, BATCH_TIMEOUTS_MS),
-      callClaude(ANALYSIS_SYSTEM_PROMPT, buildB.prompt, 6000, 55_000, BATCH_MODELS, BATCH_TIMEOUTS_MS),
+      callClaude(ANALYSIS_SYSTEM_PROMPT, buildBatchPrompt(batchA, "A"), 6000, 55_000, BATCH_MODELS),
+      callClaude(ANALYSIS_SYSTEM_PROMPT, buildBatchPrompt(batchB, "B"), 6000, 55_000, BATCH_MODELS),
     ];
-    if (buildF) promises.push(callClaude(FORWARD_SYSTEM_PROMPT, buildF.prompt, 6000, 55_000, BATCH_MODELS, BATCH_TIMEOUTS_MS));
+    if (fwdReqs.length > 0) {
+      promises.push(callClaude(FORWARD_SYSTEM_PROMPT, buildForwardPrompt(), 6000, 55_000, BATCH_MODELS));
+    }
 
     const settled = await Promise.allSettled(promises);
     const [settledA, settledB] = settled;
@@ -680,43 +513,18 @@ Deno.serve(async (req: Request) => {
     const allMatched = [...matchedA, ...matchedB];
     console.log(`[${ENGINE_VERSION}] Current matched: ${allMatched.length} of ${currentReqs.length}`);
 
-    const matchedF = matchRequirements(rawF, fwdReqs, fwdReqMap, fwdReqNameMap, "F");
-    console.log(`[${ENGINE_VERSION}] Forward matched: ${matchedF.length} of ${fwdReqs.length}`);
-
-    const pricing = await fetchModelPricing(supabase);
-
-    const costA = settledA.status === "fulfilled"
-      ? computeCallCostUsd((settledA as PromiseFulfilledResult<any>).value.model,
-                           (settledA as PromiseFulfilledResult<any>).value.inputTokens,
-                           (settledA as PromiseFulfilledResult<any>).value.outputTokens,
-                           pricing) : 0;
-    const costB = settledB.status === "fulfilled"
-      ? computeCallCostUsd((settledB as PromiseFulfilledResult<any>).value.model,
-                           (settledB as PromiseFulfilledResult<any>).value.inputTokens,
-                           (settledB as PromiseFulfilledResult<any>).value.outputTokens,
-                           pricing) : 0;
-    const costF = settledF?.status === "fulfilled"
-      ? computeCallCostUsd((settledF as PromiseFulfilledResult<any>).value.model,
-                           (settledF as PromiseFulfilledResult<any>).value.inputTokens,
-                           (settledF as PromiseFulfilledResult<any>).value.outputTokens,
-                           pricing) : 0;
-
-    const perFindingCostA = matchedA.length > 0 ? costA / matchedA.length : 0;
-    const perFindingCostB = matchedB.length > 0 ? costB / matchedB.length : 0;
-    const perFindingCostF = matchedF.length > 0 ? costF / matchedF.length : 0;
+    const validSev = ["compliant", "minor", "major", "critical"];
+    const findings: Finding[] = [];
+    const coveredIds = new Set<string>();
 
     for (const { ar, req } of allMatched) {
       const severity = validSev.includes(ar.severity) ? ar.severity : "minor";
-      const reqGrounding = (groundingByReqA.get(req.id) ?? groundingByReqB.get(req.id)) || null;
-      const perFindingCost = matchedA.some((m) => m.req.id === req.id) ? perFindingCostA : perFindingCostB;
       findings.push({
         upload_id, clause_text: (ar.clause_text || "[Not analysed]").substring(0, 1000), clause_category: req.category, statutory_ref: req.statutory_basis, requirement_id: req.id, severity,
         finding_detail: (ar.finding_detail || `${req.requirement_name}: ${severity}`).substring(0, 2000),
         remediation: severity !== "compliant" ? (ar.remediation || `Review against ${req.statutory_basis}.`).substring(0, 2000) : null,
         pillar_mapping: req.pillar_mapping, pillar_mapping_type: "primary", engine_version: ENGINE_VERSION,
         is_forward_looking: false, forward_effective_date: null, forward_source_act: null,
-        grounding_refs: reqGrounding && reqGrounding.length > 0 ? reqGrounding : null,
-        model_cost_usd: perFindingCost || null,
       });
       coveredIds.add(req.id);
     }
@@ -731,16 +539,17 @@ Deno.serve(async (req: Request) => {
           remediation: `Manually verify compliance with ${req.requirement_name} under ${req.statutory_basis}.`,
           pillar_mapping: req.pillar_mapping, pillar_mapping_type: "primary", engine_version: ENGINE_VERSION,
           is_forward_looking: false, forward_effective_date: null, forward_source_act: null,
-          grounding_refs: null, model_cost_usd: null,
         });
       }
     }
     if (gapFilled.length > 0) console.warn(`[${ENGINE_VERSION}] Gap-filled ${gapFilled.length}: ${gapFilled.join(", ")}`);
 
+    const matchedF = matchRequirements(rawF, fwdReqs, fwdReqMap, fwdReqNameMap, "F");
+    console.log(`[${ENGINE_VERSION}] Forward matched: ${matchedF.length} of ${fwdReqs.length}`);
+
     const forwardFindings: Finding[] = [];
     for (const { ar, req } of matchedF) {
       const severity = validSev.includes(ar.severity) ? ar.severity : "minor";
-      const reqGrounding = groundingByReqF.get(req.id) || null;
       forwardFindings.push({
         upload_id, clause_text: (ar.clause_text || "[No existing clause]").substring(0, 1000), clause_category: req.category, statutory_ref: req.statutory_basis, requirement_id: req.id, severity,
         finding_detail: (ar.finding_detail || `Forward exposure: ${req.requirement_name}`).substring(0, 2000),
@@ -749,8 +558,6 @@ Deno.serve(async (req: Request) => {
         is_forward_looking: true,
         forward_effective_date: req.effective_from || null,
         forward_source_act: req.source_act || "Employment Rights Act 2025",
-        grounding_refs: reqGrounding && reqGrounding.length > 0 ? reqGrounding : null,
-        model_cost_usd: perFindingCostF || null,
       });
     }
 
@@ -765,7 +572,6 @@ Deno.serve(async (req: Request) => {
           is_forward_looking: true,
           forward_effective_date: req.effective_from || null,
           forward_source_act: req.source_act || "Employment Rights Act 2025",
-          grounding_refs: null, model_cost_usd: null,
         });
       }
     }
@@ -821,11 +627,6 @@ Deno.serve(async (req: Request) => {
       gap_filled: gapFilled.length,
       sparse_ratio: Math.round(sparseRatio * 100),
       engine_version: ENGINE_VERSION,
-      total_cost_usd: Math.round((costA + costB + costF) * 1_000_000) / 1_000_000,
-      grounding_coverage: Math.round(
-        (allMatched.filter((m) => ((groundingByReqA.get(m.req.id) ?? groundingByReqB.get(m.req.id))?.length ?? 0) > 0).length /
-         Math.max(allMatched.length, 1)) * 100
-      ),
     });
   } catch (e) {
     const msg = (e as Error).message || "Unknown error";
