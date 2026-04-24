@@ -122,13 +122,20 @@ async function resyncRow(
   });
   if (logErr) console.error('[w7-hmcts-resync] w7_resync_log insert failed', logErr);
 
-  // Update resync timestamps on every run
+  // Update resync timestamps + content_hash on every successful fetch.
+  // content_hash is ALWAYS written so NULL-hash rows (97.85% of corpus on day
+  // zero) establish a detection baseline on their first successful resync —
+  // without this, `changed` would remain false forever because hashBefore
+  // would never transition away from NULL.
+  // resync_change_detected_at stays gated on the `changed` predicate so
+  // first-resync baseline establishment does not falsely signal a content
+  // change to downstream re-enrichment workers.
   const updatePayload: Record<string, unknown> = {
     last_resync_at: new Date().toISOString(),
     resync_processed_date: todayStr,
+    content_hash: newHash,
   };
   if (changed) {
-    updatePayload.content_hash = newHash;
     updatePayload.resync_change_detected_at = new Date().toISOString();
   }
   const { error: updErr } = await sb
