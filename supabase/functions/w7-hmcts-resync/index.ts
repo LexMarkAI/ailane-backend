@@ -1,11 +1,26 @@
 // supabase/functions/w7-hmcts-resync/index.ts
 // AILANE-SPEC-DMSP-002-W7 §13.1-§13.6
-// AMD-089 Stage A · CC Build Brief 1 · v1.1 (batched self-chaining per COP P1-3/P1-4)
+// AMD-095 · Operational fix v4: throughput + hash stability + chain trigger + jitter + recent-first cohort
 // Deploy: verify_jwt=false (pipeline-class; invoked by pg_cron with service-role bearer)
+// Authoring: 2026-04-25 · Path A Chairman MCP deploy under express Director instruction
+//
+// Changes from v2 (AMD-089 Stage A):
+//   - DEFAULT_BATCH_SIZE: 150 -> 60 (fits in Supabase Edge Function 150s gateway timeout)
+//   - INTER_REQUEST_DELAY: fixed 2000ms -> jittered 750-1250ms (mean 1000ms; defeats metronomic detection)
+//   - STARTUP_JITTER_MAX_MS: 0 -> 30000 (random 0-30s pause at first chain link only; modest start-time variance)
+//   - MAX_CHAIN_DEPTH: 50 -> 30 (Director-instructed conservative cap; ~1,800 rows/day, ~73-day full coverage)
+//   - Chain trigger: cohort.length >= limit -> cohort.length > 0 (chain on any work; cohort RPC's
+//     daily-idempotency filter is the natural terminator)
+//   - Hash input: raw HTTP body -> text-extracted content (strip scripts/styles/tags/
+//     comments/whitespace) to eliminate false-positive change detection from dynamic UI
+//   - Hash format: 'v2:' prefix added; v1 hashes (raw HTML body) recognised as method-
+//     migration baselines, NOT logged as content changes
+//   - Cohort RPC ordering (separate migration w7_cohort_recent_first_amd_095):
+//     last_resync_at NULLS FIRST, enriched DESC, decision_date DESC, id
+//     -> prioritises commercially most-relevant rows (enriched + recent) for baselining
 
 import { createClient } from 'npm:@supabase/supabase-js@2';
 
-// SEC-001 §4 secret validation
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL');
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');
 
@@ -13,12 +28,12 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   console.error('[w7-hmcts-resync] missing required secret(s) at cold start');
 }
 
-// Batch sizing — COP P1-3/P1-4 resolution
-// 150 rows × 2 s inter-request delay + ~50 s overhead ≈ 350 s per invocation,
-// safely under the Supabase Edge Function 400 s execution-time limit (Pro plan).
-const DEFAULT_BATCH_SIZE = 150;
-const MAX_CHAIN_DEPTH = 50;             // safety cap against runaway chains
-const INTER_REQUEST_DELAY_MS = 2000;    // HMCTS politeness window
+const HASH_VERSION = 'v2';
+const DEFAULT_BATCH_SIZE = 60;
+const MAX_CHAIN_DEPTH = 30;
+const INTER_REQUEST_DELAY_BASE_MS = 1000;
+const INTER_REQUEST_DELAY_JITTER_MS = 500;  // ±250 around base = 750-1250ms actual
+const STARTUP_JITTER_MAX_MS = 30_000;         // 0-30s random pause on first chain link only
 const MAX_RETRIES = 3;
 const RETRY_BACKOFF_MS = [1000, 3000, 9000];
 const BATCH_FAILURE_ALERT_PCT = 0.02;
@@ -30,13 +45,44 @@ interface Decision {
   last_resync_at: string | null;
 }
 
-async function computeHash(body: string): Promise<string> {
+// Stable text extraction: strip dynamic page elements before hashing.
+// HMCTS pages contain timestamps, session tokens, CSRF tokens, cache-bust query
+// strings on assets, and meta tags that change between requests. Hashing the raw
+// body would produce false-positive change events on every refetch.
+function extractTextContent(html: string): string {
+  return html
+    .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, ' ')
+    .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, ' ')
+    .replace(/<noscript\b[^<]*(?:(?!<\/noscript>)<[^<]*)*<\/noscript>/gi, ' ')
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+async function computeHash(content: string): Promise<string> {
   const encoder = new TextEncoder();
-  const data = encoder.encode(body);
+  const data = encoder.encode(content);
   const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-  return Array.from(new Uint8Array(hashBuffer))
+  const hex = Array.from(new Uint8Array(hashBuffer))
     .map((b) => b.toString(16).padStart(2, '0'))
     .join('');
+  return `${HASH_VERSION}:${hex}`;
+}
+
+// Per-row jittered delay. Average remains INTER_REQUEST_DELAY_BASE_MS so throughput
+// math is unchanged, but the inter-request rhythm becomes irregular rather than
+// metronomic — defeats simple "fixed-rate bot" pattern detection.
+function jitteredDelayMs(): number {
+  const base = INTER_REQUEST_DELAY_BASE_MS;
+  const jitter = INTER_REQUEST_DELAY_JITTER_MS;
+  return Math.floor((base - jitter / 2) + Math.random() * jitter);
 }
 
 async function fetchWithRetry(url: string): Promise<{ body: string; status: number } | null> {
@@ -80,14 +126,11 @@ async function selectCohort(
 async function resyncRow(
   sb: ReturnType<typeof createClient>,
   decision: Decision,
-): Promise<'unchanged' | 'changed' | 'failed'> {
+): Promise<'unchanged' | 'changed' | 'baseline_established' | 'migrated' | 'failed'> {
   const fetched = await fetchWithRetry(decision.source_url);
-  // Today's date stamp (yyyy-mm-dd) for resync_processed_date
   const todayStr = new Date().toISOString().split('T')[0];
 
   if (!fetched || fetched.status >= 400) {
-    // Mark as processed-today anyway so the chain advances and this row is
-    // retried on the next nightly run, not repeatedly within the same night.
     await sb
       .from('tribunal_decisions')
       .update({ resync_processed_date: todayStr })
@@ -95,11 +138,19 @@ async function resyncRow(
     return 'failed';
   }
 
-  const newHash = await computeHash(fetched.body);
+  const textContent = extractTextContent(fetched.body);
+  const newHash = await computeHash(textContent);
   const hashBefore = decision.content_hash;
-  const changed = hashBefore !== null && hashBefore !== newHash;
 
-  // Read current flag state for _before capture (spec §13.5 w7_resync_log schema)
+  // Three pre-states for hashBefore:
+  //   1. NULL                  -> first baseline establishment
+  //   2. v1 (no 'v2:' prefix)  -> method-migration baseline (do NOT log as content change)
+  //   3. v2 prefix             -> comparable; flag change_detected if hashes differ
+  const isFirstBaseline = hashBefore === null;
+  const isV1Migration = hashBefore !== null && !hashBefore.startsWith(`${HASH_VERSION}:`);
+  const isV2Comparable = hashBefore !== null && hashBefore.startsWith(`${HASH_VERSION}:`);
+  const changed = isV2Comparable && hashBefore !== newHash;
+
   const { data: enrichmentRow } = await sb
     .from('tribunal_enrichment')
     .select('restricted_reporting_order, soa_1992_identified')
@@ -109,27 +160,21 @@ async function resyncRow(
   const rroBefore = enrichmentRow?.restricted_reporting_order ?? null;
   const soaBefore = enrichmentRow?.soa_1992_identified ?? null;
 
-  // Log every resync event (change_detected boolean records mismatch vs. match)
   const { error: logErr } = await sb.from('w7_resync_log').insert({
     decision_id: decision.id,
     hash_before: hashBefore,
     hash_after: newHash,
     change_detected: changed,
     rro_before: rroBefore,
-    rro_after: rroBefore,    // _after unchanged at this stage; re-enrichment updates later
+    rro_after: rroBefore,
     soa_before: soaBefore,
     soa_after: soaBefore,
   });
   if (logErr) console.error('[w7-hmcts-resync] w7_resync_log insert failed', logErr);
 
-  // Update resync timestamps + content_hash on every successful fetch.
-  // content_hash is ALWAYS written so NULL-hash rows (97.85% of corpus on day
-  // zero) establish a detection baseline on their first successful resync —
-  // without this, `changed` would remain false forever because hashBefore
-  // would never transition away from NULL.
-  // resync_change_detected_at stays gated on the `changed` predicate so
-  // first-resync baseline establishment does not falsely signal a content
-  // change to downstream re-enrichment workers.
+  // content_hash always written in v2 format. resync_change_detected_at gated on real
+  // content change so first-baselines and method-migrations don't trip downstream
+  // re-enrichment workers.
   const updatePayload: Record<string, unknown> = {
     last_resync_at: new Date().toISOString(),
     resync_processed_date: todayStr,
@@ -147,6 +192,8 @@ async function resyncRow(
     return 'failed';
   }
 
+  if (isFirstBaseline) return 'baseline_established';
+  if (isV1Migration) return 'migrated';
   return changed ? 'changed' : 'unchanged';
 }
 
@@ -155,9 +202,6 @@ function enqueueNextBatch(
   limit: number,
   chainDepth: number,
 ): void {
-  // Fire-and-forget follow-up invocation (COP P1-3/P1-4 self-chaining pattern).
-  // Do not await; wrap in EdgeRuntime.waitUntil so the current response returns
-  // cleanly while the follow-up request begins.
   const nextCall = fetch(`${SUPABASE_URL}/functions/v1/w7-hmcts-resync`, {
     method: 'POST',
     headers: {
@@ -186,7 +230,6 @@ Deno.serve(async (req) => {
     });
   }
 
-  // COP P2-4: name the missing secret in the structured error response.
   if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
     const missing: string[] = [];
     if (!SUPABASE_URL) missing.push('SUPABASE_URL');
@@ -214,7 +257,6 @@ Deno.serve(async (req) => {
   const limit = Math.max(1, Math.min(DEFAULT_BATCH_SIZE, body.limit ?? DEFAULT_BATCH_SIZE));
   const chainDepth = body.chain_depth ?? 0;
 
-  // Chain-depth safety cap
   if (chainDepth >= MAX_CHAIN_DEPTH) {
     console.error(`[w7-hmcts-resync] chain depth ${chainDepth} >= ${MAX_CHAIN_DEPTH}; terminating chain for channel ${channel}`);
     return new Response(JSON.stringify({
@@ -223,24 +265,36 @@ Deno.serve(async (req) => {
     }), { status: 200, headers: { 'Content-Type': 'application/json' } });
   }
 
-  // Cohort selection — already filters out rows with resync_processed_date = CURRENT_DATE
+  // Startup jitter on the first chain link only (chain_depth=0 = the cron-fired kickoff).
+  // Adds 0-30s of randomness to the actual HMCTS request start time so HMCTS doesn't
+  // see exactly 02:00:00 every day. Subsequent chain links (depth>=1) start immediately
+  // to preserve total run-time predictability and stay within Supabase EF gateway budget.
+  if (chainDepth === 0 && STARTUP_JITTER_MAX_MS > 0) {
+    const jitterMs = Math.floor(Math.random() * STARTUP_JITTER_MAX_MS);
+    if (jitterMs > 0) {
+      console.log(`[w7-hmcts-resync] channel ${channel} startup jitter: ${jitterMs}ms`);
+      await new Promise((r) => setTimeout(r, jitterMs));
+    }
+  }
+
   const cohort = await selectCohort(sb, channel, limit);
 
   if (cohort.length === 0) {
-    // Nightly cohort exhausted — chain terminates naturally
     return new Response(JSON.stringify({
       channel, limit, chain_depth: chainDepth,
       cohort_size: 0, result: 'chain_complete',
     }), { status: 200, headers: { 'Content-Type': 'application/json' } });
   }
 
-  let unchanged = 0, changed = 0, failed = 0;
+  let unchanged = 0, changed = 0, failed = 0, baselined = 0, migrated = 0;
   for (const decision of cohort) {
     const outcome = await resyncRow(sb, decision);
     if (outcome === 'unchanged') unchanged++;
     else if (outcome === 'changed') changed++;
+    else if (outcome === 'baseline_established') baselined++;
+    else if (outcome === 'migrated') migrated++;
     else failed++;
-    await new Promise((r) => setTimeout(r, INTER_REQUEST_DELAY_MS));
+    await new Promise((r) => setTimeout(r, jitteredDelayMs()));
   }
 
   const failureRate = cohort.length ? failed / cohort.length : 0;
@@ -248,8 +302,10 @@ Deno.serve(async (req) => {
     console.error(`[w7-hmcts-resync] batch failure rate ${(failureRate * 100).toFixed(2)}% exceeds ${BATCH_FAILURE_ALERT_PCT * 100}% threshold`);
   }
 
-  // Self-chain: if batch was full, more rows likely remain — enqueue next batch
-  const chainContinues = cohort.length >= limit;
+  // Chain trigger: chain whenever cohort returned any work. The cohort RPC's daily-
+  // idempotency filter (resync_processed_date < CURRENT_DATE) ensures the cohort
+  // returns 0 once today's eligible work is exhausted, naturally terminating the chain.
+  const chainContinues = cohort.length > 0;
   if (chainContinues) {
     enqueueNextBatch(channel, limit, chainDepth);
   }
@@ -261,6 +317,8 @@ Deno.serve(async (req) => {
       cohort_size: cohort.length,
       unchanged,
       changed,
+      baselined,
+      migrated,
       failed,
       failure_rate: failureRate,
       chain_continues: chainContinues,
